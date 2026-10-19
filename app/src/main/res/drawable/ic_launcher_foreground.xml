@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 为圆形和圆角桌面裁切留出空间，保留机器人与光环。 -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android" android:inset="16.67%">
+    <bitmap android:src="@drawable/ic_launcher_art" android:gravity="fill" android:filter="true" />
+</inset>

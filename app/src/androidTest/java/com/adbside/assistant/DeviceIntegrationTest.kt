@@ -16,6 +16,47 @@ import android.provider.DocumentsContract
 /** 仅供测试：通过 USB 中继验证真机上的 ADB 文件协议。 */
 @RunWith(AndroidJUnit4::class)
 class DeviceIntegrationTest {
+    /** 只更新本轮生成的测试应用，验证本机普通包、拆分包和陈旧选择保护。 */
+    @Test fun testPushLocalInstalledApps() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val app = instrumentation.targetContext.applicationContext as Application
+        val arguments = InstrumentationRegistry.getArguments()
+        val fixtures = listOf(arguments.getString("singlePackage")!! to 1, arguments.getString("splitPackage")!! to 2)
+        val model = AssistantModel(app)
+        try {
+            model.connect("127.0.0.1", "18777")
+            waitFor { !model.state.value.busy }
+            assertTrue(model.state.value.message, model.state.value.connected)
+            for ((packageName, count) in fixtures) {
+                require(packageName.startsWith("com.adbside.testpush."))
+                val entry = LocalApps(app).read(packageName, withIcon = true)
+                assertEquals(count, entry.apkPaths.size)
+                assertEquals("1.0", entry.versionName)
+                assertTrue(entry.totalBytes > 0)
+                assertNotNull(entry.icon)
+                model.pushLocalApp(entry.copy(updatedAt = entry.updatedAt - 1), model.state.value.address)
+                waitFor { !model.state.value.busy }
+                assertTrue(model.state.value.localInstall!!.error.contains("已更新"))
+                assertFalse(model.state.value.localInstall!!.success)
+                model.dismissLocalInstall()
+                model.pushLocalApp(entry, model.state.value.address)
+                waitFor { !model.state.value.busy }
+                val result = model.state.value.localInstall!!
+                assertTrue(result.error + result.cleanupWarning, result.success)
+                assertTrue(result.finished)
+                assertEquals(entry.totalBytes, result.uploadedBytes)
+                assertEquals(count, result.completedPackages)
+                assertEquals("", result.cleanupWarning)
+                assertEquals(count, LocalApps(app).read(packageName).apkPaths.size)
+                assertTrue(app.cacheDir.listFiles().orEmpty().none { it.name.startsWith("local-app-") })
+                model.dismissLocalInstall()
+            }
+        } finally {
+            model.disconnect()
+            waitFor { !model.state.value.busy }
+        }
+    }
+
     /** 等待异步界面状态，超时后输出具体断言位置。 */
     private fun waitFor(condition: () -> Boolean) {
         val deadline = System.currentTimeMillis() + 30000

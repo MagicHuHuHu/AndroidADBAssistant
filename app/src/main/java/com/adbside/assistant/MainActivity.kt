@@ -97,6 +97,7 @@ fun AssistantApp(model: AssistantModel = viewModel()) {
     if (state.message.isNotBlank()) AlertDialog(onDismissRequest = { model.message("") },
         title = { Text("操作提示") }, text = { Text(state.message, Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) },
         confirmButton = { TextButton(onClick = { model.message("") }) { Text("知道了") } })
+    state.localInstall?.let { LocalInstallDialog(it, state.busy, model::dismissLocalInstall) }
 }
 
 /** 显示页面标题与当前连接设备。 */
@@ -156,9 +157,11 @@ private fun DevicePage(model: AssistantModel, state: AssistantState) {
             ActionButton("主页键", Icons.Outlined.Home, state.connected && !state.busy) { model.deviceAction("主页键") }
         }
         Text("添加设备", fontWeight = FontWeight.Bold)
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            FilterChip(pairing, { pairing = true }, { Text("无线配对") })
-            FilterChip(!pairing, { pairing = false }, { Text("IP 直连") })
+        TabRow(selectedTabIndex = if (pairing) 0 else 1, containerColor = Color.Transparent) {
+            Tab(selected = pairing, onClick = { pairing = true }, text = { Text("无线配对") },
+                selectedContentColor = MaterialTheme.colorScheme.primary, unselectedContentColor = MaterialTheme.colorScheme.onSurfaceVariant)
+            Tab(selected = !pairing, onClick = { pairing = false }, text = { Text("IP 直连") },
+                selectedContentColor = MaterialTheme.colorScheme.primary, unselectedContentColor = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         OutlinedTextField(host, { host = it.trim().replace('。', '.') }, Modifier.fillMaxWidth(), label = { Text("设备 B 的 IP 地址") }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), singleLine = true)
         if (pairing) {
@@ -200,19 +203,29 @@ private fun AppsPage(model: AssistantModel, state: AssistantState) {
     var selected by remember { mutableStateOf<AppEntry?>(null) }
     var confirmation by remember { mutableStateOf<Pair<String, String>?>(null) }
     var exportPackage by rememberSaveable { mutableStateOf("") }
+    var showLocalApps by remember { mutableStateOf(false) }
+    var selectedLocalApp by remember { mutableStateOf<LocalAppEntry?>(null) }
+    var localTargetAddress by remember { mutableStateOf("") }
+    var localTargetName by remember { mutableStateOf("") }
     val installer = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let { confirmation = "安装 APK" to it.toString() } }
     val exporter = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/vnd.android.package-archive")) { uri -> uri?.let { model.exportApk(exportPackage, it) } }
     LaunchedEffect(state.connected, system) { if (state.connected) model.loadApps(system) }
     Column(Modifier.fillMaxSize().padding(horizontal = 20.dp)) {
         PageHeader("应用管理", state)
         OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth(), placeholder = { Text("搜索包名") }, leadingIcon = { Icon(Icons.Outlined.Search, null) }, singleLine = true)
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            FilterChip(!system, { system = false }, { Text("用户应用") })
-            FilterChip(system, { system = true }, { Text("系统应用") })
+        TabRow(selectedTabIndex = if (system) 1 else 0, containerColor = Color.Transparent) {
+            Tab(selected = !system, onClick = { system = false }, text = { Text("用户应用") },
+                selectedContentColor = MaterialTheme.colorScheme.primary, unselectedContentColor = MaterialTheme.colorScheme.onSurfaceVariant)
+            Tab(selected = system, onClick = { system = true }, text = { Text("系统应用") },
+                selectedContentColor = MaterialTheme.colorScheme.primary, unselectedContentColor = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Button({ installer.launch(arrayOf("application/vnd.android.package-archive", "application/octet-stream")) }, enabled = state.connected && !state.busy) { Icon(Icons.Outlined.Add, null); Text("安装 APK") }
+            Spacer(Modifier.width(8.dp))
+            OutlinedButton({ showLocalApps = true; model.loadLocalApps() }, enabled = state.connected && !state.busy) { Text("从本机安装") }
             Spacer(Modifier.weight(1f))
             IconButton({ model.loadApps(system) }, enabled = state.connected && !state.busy) { Icon(Icons.Outlined.Refresh, "刷新") }
         }
-        Button({ installer.launch(arrayOf("application/vnd.android.package-archive", "application/octet-stream")) }, enabled = state.connected && !state.busy) { Icon(Icons.Outlined.Add, null); Text("安装 APK") }
         if (!state.connected) EmptyHint("先到设备页连接设备 B")
         else LazyColumn(Modifier.weight(1f)) {
             items(state.apps.filter { it.packageName.contains(query, true) }, key = { it.packageName }) { app ->
@@ -247,6 +260,20 @@ private fun AppsPage(model: AssistantModel, state: AssistantState) {
         ConfirmDialog("确认$action？", if (action == "安装 APK") "将在设备 B 上安装所选 APK；同包名应用可能被更新。" else "$target\n${if (action == "清除数据") "应用本地数据将被删除，无法撤销。" else if (action == "卸载应用") "应用及其本地数据将被删除。" else "应用当前运行会被中断。"}", { confirmation = null }) {
             confirmation = null
             if (action == "安装 APK") model.install(android.net.Uri.parse(target)) else model.appAction(target, action)
+        }
+    }
+    if (showLocalApps) LocalAppsDialog(state, dismiss = { showLocalApps = false }, select = {
+        selectedLocalApp = it
+        localTargetAddress = state.address
+        localTargetName = state.device
+        showLocalApps = false
+    })
+    selectedLocalApp?.let { app ->
+        ConfirmDialog("推送并安装此应用？",
+            "${app.name}\n${app.packageName}\nversionName：${app.versionName}\nversionCode：${app.versionCode}\n安装包：${app.apkPaths.size} 个，共 ${formatSize(app.totalBytes)}\n\n目标：$localTargetName · $localTargetAddress\n\n仅迁移安装包，不包含账号和应用数据。同包名应用会尝试更新，签名冲突时不会自动卸载。",
+            { selectedLocalApp = null }) {
+            selectedLocalApp = null
+            model.pushLocalApp(app, localTargetAddress)
         }
     }
 }

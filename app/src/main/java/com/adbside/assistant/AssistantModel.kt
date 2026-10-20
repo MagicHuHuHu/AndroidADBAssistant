@@ -20,6 +20,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.io.File
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -36,7 +37,9 @@ data class AssistantState(
     val path: String = "/sdcard", val files: List<RemoteFile> = emptyList(),
     val terminal: String = "连接设备后即可执行 shell 命令。\n", val history: List<String> = emptyList(), val terminalRunning: Boolean = false,
     val terminalPath: String = "/",
-    val transfers: List<TransferEntry> = emptyList(), val downloadTree: String = "", val screenshotPreview: Bitmap? = null
+    val transfers: List<TransferEntry> = emptyList(), val downloadTree: String = "", val screenshotPreview: Bitmap? = null,
+    val localApps: List<LocalAppEntry> = emptyList(), val localAppsLoading: Boolean = false,
+    val localInstall: LocalInstallProgress? = null
 )
 
 /** 统一管理连接与界面状态，所有网络和文件操作均在后台执行。 */
@@ -109,7 +112,7 @@ class AssistantModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** 执行有超时和输出上限的 shell，避免无限命令占满资源。 */
-    private fun shell(command: String, terminal: Boolean = false, terminalPrefix: String = ""): String {
+    private fun shell(command: String, terminal: Boolean = false, terminalPrefix: String = "", timeoutSeconds: Long = 30): String {
         check(manager.isConnected) { "请先连接设备 B" }
         val completion = "ADB_DONE_${UUID.randomUUID().toString().replace("-", "")}:"
         val directoryMarker = "ADB_CWD_${UUID.randomUUID().toString().replace("-", "")}:"
@@ -123,7 +126,7 @@ class AssistantModel(application: Application) : AndroidViewModel(application) {
         val encoded = android.util.Base64.encodeToString(script.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
         manager.openStream("shell:echo $encoded | base64 -d | sh").use { stream ->
             if (terminal) terminalStream = stream
-            val timeout = timer.schedule({ runCatching { stream.close() } }, 30, TimeUnit.SECONDS)
+            val timeout = timer.schedule({ runCatching { stream.close() } }, timeoutSeconds, TimeUnit.SECONDS)
             try {
                 if (terminal && terminalStopRequested) error("命令已停止")
                 val bytes = ByteArrayOutputStream()
@@ -140,7 +143,7 @@ class AssistantModel(application: Application) : AndroidViewModel(application) {
                         if (terminal) mutable.update { it.copy(terminal = (terminalPrefix + bytes.toString("UTF-8").substringBefore(directoryMarker).substringBefore(completion)).takeLast(100_000)) }
                     }
                 }
-                if (timeout.isDone) error("命令超过 30 秒，已停止")
+                if (timeout.isDone) error("命令超过 $timeoutSeconds 秒，已停止")
                 val result = bytes.toString("UTF-8")
                 val index = result.lastIndexOf(completion)
                 check(index >= 0 && result.substring(index + completion.length).trim().toIntOrNull() != null) { "命令已停止或连接中断，输出可能不完整" }
@@ -160,9 +163,9 @@ class AssistantModel(application: Application) : AndroidViewModel(application) {
     }
 
     /** 检查远端命令退出码，使安装与应用管理正确报告失败。 */
-    private fun checked(command: String): String {
+    private fun checked(command: String, timeoutSeconds: Long = 30): String {
         val marker = "ADB_SIDE_${UUID.randomUUID().toString().replace("-", "")}:"
-        val output = shell("( $command ); r=\$?; printf '\\n$marker%s' \"\$r\"")
+        val output = shell("( $command ); r=\$?; printf '\\n$marker%s' \"\$r\"", timeoutSeconds = timeoutSeconds)
         val index = output.lastIndexOf(marker)
         check(index >= 0) { "未收到命令完成状态" }
         val result = output.substring(0, index).trim()
@@ -480,6 +483,66 @@ class AssistantModel(application: Application) : AndroidViewModel(application) {
             check(result.contains("Success")) { result }
             message("APK 安装成功，请刷新应用列表")
         } finally { runCatching { checked("rm -f ${shellQuote(path)}") } }
+    }
+
+    /** 读取本机应用，不占用设备 B 的命令通道。 */
+    fun loadLocalApps() {
+        if (mutable.value.localAppsLoading) return
+        mutable.update { it.copy(localAppsLoading = true) }
+        viewModelScope.launch {
+            try {
+                val apps = withContext(Dispatchers.IO) { LocalApps(getApplication()).list() }
+                mutable.update { it.copy(localApps = apps) }
+            } catch (e: Exception) { message(e.message ?: "无法读取本机应用") }
+            finally { mutable.update { it.copy(localAppsLoading = false) } }
+        }
+    }
+
+    /** 复制选中的完整 APK 集合，确认应用未更新后上传并安装。 */
+    fun pushLocalApp(app: LocalAppEntry, expectedAddress: String) = runAction {
+        check(manager.isConnected && mutable.value.connected && mutable.value.address == expectedAddress) { "目标设备已变化，请重新选择并确认" }
+        val target = "${mutable.value.device} · $expectedAddress"
+        mutable.update { it.copy(localInstall = LocalInstallProgress(app.name, target, app.totalBytes, app.apkPaths.size)) }
+        val directory = File(getApplication<Application>().cacheDir, "local-app-${UUID.randomUUID()}")
+        try {
+            val repository = LocalApps(getApplication())
+            val current = repository.read(app.packageName)
+            check(current.versionCode == app.versionCode && current.updatedAt == app.updatedAt && current.apkPaths == app.apkPaths && current.apkSizes == app.apkSizes) { "本机应用已更新，请重新选择应用" }
+            check(directory.mkdir()) { "无法创建安装包缓存目录，请检查本机存储空间" }
+            val files = mutableListOf<File>()
+            for ((index, path) in app.apkPaths.withIndex()) {
+                mutable.update { it.copy(localInstall = it.localInstall?.copy(stage = "正在提取安装包 ${index + 1}/${app.apkPaths.size}")) }
+                val source = File(path)
+                check(source.isFile && source.canRead()) { "无法读取安装包：${source.name}" }
+                val destination = File(directory, "package_$index.apk")
+                source.copyTo(destination)
+                check(destination.length() == app.apkSizes[index]) { "安装包已变化，请重新选择应用" }
+                files += destination
+            }
+            val afterCopy = repository.read(app.packageName)
+            check(afterCopy.updatedAt == app.updatedAt && afterCopy.apkPaths == app.apkPaths && afterCopy.apkSizes == app.apkSizes) { "提取期间本机应用已变化，请重新选择" }
+            check(manager.isConnected && mutable.value.address == expectedAddress) { "目标设备已断开或变化" }
+            val installer = LocalAppInstaller(
+                execute = { command, timeout -> checked(command, timeout) },
+                upload = { file, remote, progress -> file.inputStream().use { source -> sync { it.send(remote, source, progress) } } }
+            )
+            installer.install(files, progress = { stage, bytes, count ->
+                mutable.update { it.copy(localInstall = it.localInstall?.copy(stage = stage, uploadedBytes = bytes, completedPackages = count)) }
+            }, cleanup = { warning -> mutable.update { it.copy(localInstall = it.localInstall?.copy(cleanupWarning = warning)) } })
+            mutable.update { it.copy(localInstall = it.localInstall?.copy(stage = "安装成功", finished = true, success = true)) }
+        } catch (e: Exception) {
+            android.util.Log.e("AdbAssistant", "本机应用推送失败", e)
+            mutable.update { it.copy(localInstall = it.localInstall?.copy(stage = "推送失败", finished = true, error = e.message ?: "安装失败"), connected = manager.isConnected) }
+        } finally {
+            if (directory.exists() && !directory.deleteRecursively()) {
+                mutable.update { it.copy(localInstall = it.localInstall?.copy(cleanupWarning = listOfNotNull(it.localInstall?.cleanupWarning?.takeIf { text -> text.isNotBlank() }, "本机临时安装包未能清理").joinToString("\n"))) }
+            }
+        }
+    }
+
+    /** 安装完成后关闭结果窗口，返回应用列表。 */
+    fun dismissLocalInstall() {
+        if (!mutable.value.busy) mutable.update { it.copy(localInstall = null) }
     }
 
     /** 下载应用基础 APK，拆分包提示用户仍需其他 split APK。 */

@@ -1,7 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 本机应用推送需要枚举已安装应用，安装包仅发送到用户确认的 ADB 设备。 -->
+    <!-- 应用管理是核心功能，需要包含无桌面入口的应用；仅对此处忽略宽泛可见性检查。 -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
     <application android:label="ADB 助手" android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:allowBackup="false" android:supportsRtl="true"
         android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher">

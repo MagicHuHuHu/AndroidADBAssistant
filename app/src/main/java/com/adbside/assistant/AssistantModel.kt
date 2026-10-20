@@ -34,7 +34,8 @@ data class AssistantState(
     val connected: Boolean = false, val device: String = "", val address: String = "",
     val busy: Boolean = false, val message: String = "", val apps: List<AppEntry> = emptyList(),
     val path: String = "/sdcard", val files: List<RemoteFile> = emptyList(),
-    val terminal: String = "连接设备后即可执行 shell 命令。\n", val history: List<String> = emptyList(),
+    val terminal: String = "连接设备后即可执行 shell 命令。\n", val history: List<String> = emptyList(), val terminalRunning: Boolean = false,
+    val terminalPath: String = "/",
     val transfers: List<TransferEntry> = emptyList(), val downloadTree: String = "", val screenshotPreview: Bitmap? = null
 )
 
@@ -51,7 +52,8 @@ class AssistantModel(application: Application) : AndroidViewModel(application) {
     private val transferJobs = java.util.concurrent.ConcurrentHashMap<String, Job>()
     private val retries = java.util.concurrent.ConcurrentHashMap<String, () -> Unit>()
     private val operation = AtomicBoolean(false)
-    private var terminalStream: AdbStream? = null
+    @Volatile private var terminalStream: AdbStream? = null
+    @Volatile private var terminalStopRequested = false
     private var screenshotBytes: ByteArray? = null
     private val resolver get() = getApplication<Application>().contentResolver
 
@@ -63,7 +65,8 @@ class AssistantModel(application: Application) : AndroidViewModel(application) {
             try { withContext(Dispatchers.IO) { action() } }
             catch (e: Exception) {
                 android.util.Log.e("AdbAssistant", "操作失败", e)
-                mutable.update { it.copy(message = e.message ?: "操作失败：${e.javaClass.simpleName}", connected = runCatching { manager.isConnected }.getOrDefault(false)) }
+                val connected = runCatching { manager.isConnected }.getOrDefault(false)
+                mutable.update { it.copy(message = e.message ?: "操作失败：${e.javaClass.simpleName}", connected = connected, terminalPath = if (connected) it.terminalPath else "/") }
             } finally { operation.set(false); mutable.update { it.copy(busy = false) } }
         }
     }
@@ -87,10 +90,12 @@ class AssistantModel(application: Application) : AndroidViewModel(application) {
         require(host.isNotBlank()) { "请输入设备 B 的 IP 地址" }
         val p = port(connectionPort)
         manager.disconnect()
+        mutable.update { it.copy(connected = false, terminalPath = "/") }
         check(manager.connect(host.trim(), p)) { "连接失败，请检查连接端口及设备 B 的授权提示" }
         val name = shell("getprop ro.product.model").trim().ifEmpty { "Android 设备" }
+        val terminalPath = shell("pwd -L").trim().ifEmpty { "/" }
         prefs.edit().putString("host", host.trim()).putString("port", connectionPort).apply()
-        mutable.update { it.copy(connected = true, device = name, address = "${host.trim()}:$p", files = emptyList(), apps = emptyList(), message = "已连接 $name") }
+        mutable.update { it.copy(connected = true, device = name, address = "${host.trim()}:$p", files = emptyList(), apps = emptyList(), terminalPath = terminalPath, message = "已连接 $name") }
     }
 
     /** 关闭连接并终止所有传输。 */
@@ -99,21 +104,28 @@ class AssistantModel(application: Application) : AndroidViewModel(application) {
         terminalStream?.let { runCatching { it.close() } }
         runAction {
             manager.disconnect()
-            mutable.update { it.copy(connected = false, device = "", files = emptyList(), apps = emptyList(), message = "已断开连接") }
+            mutable.update { it.copy(connected = false, device = "", files = emptyList(), apps = emptyList(), terminalPath = "/", message = "已断开连接") }
         }
     }
 
     /** 执行有超时和输出上限的 shell，避免无限命令占满资源。 */
-    private fun shell(command: String, terminal: Boolean = false): String {
+    private fun shell(command: String, terminal: Boolean = false, terminalPrefix: String = ""): String {
         check(manager.isConnected) { "请先连接设备 B" }
         val completion = "ADB_DONE_${UUID.randomUUID().toString().replace("-", "")}:"
+        val directoryMarker = "ADB_CWD_${UUID.randomUUID().toString().replace("-", "")}:"
         // 上游 OPEN 请求按字符数分配缓冲，先转为 ASCII，避免中文命令或路径导致溢出。
-        val script = "(\n$command\n); printf '\\n$completion%s' \"\$?\""
+        // 在同一命令环境中读取执行后的目录，避免仅解析 cd 文本漏掉相对路径或组合命令。
+        val setup = if (terminal) """
+            cd ${shellQuote(mutable.value.terminalPath)} || { echo '当前目录不可用，已返回根目录'; cd / || exit; }
+            trap 'terminal_status=${'$'}?; printf "\n$directoryMarker"; pwd -L | base64 | tr -d "\n"; printf "\n"; exit "${'$'}terminal_status"' EXIT
+        """.trimIndent() else ""
+        val script = "(\n$setup\n$command\n); printf '\\n$completion%s' \"\$?\""
         val encoded = android.util.Base64.encodeToString(script.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP)
         manager.openStream("shell:echo $encoded | base64 -d | sh").use { stream ->
             if (terminal) terminalStream = stream
             val timeout = timer.schedule({ runCatching { stream.close() } }, 30, TimeUnit.SECONDS)
             try {
+                if (terminal && terminalStopRequested) error("命令已停止")
                 val bytes = ByteArrayOutputStream()
                 val buffer = ByteArray(8192)
                 stream.openInputStream().use { input ->
@@ -125,14 +137,24 @@ class AssistantModel(application: Application) : AndroidViewModel(application) {
                         if (n < 0) break
                         check(bytes.size() + n <= 2 * 1024 * 1024) { "输出超过 2 MB，请缩小命令范围" }
                         bytes.write(buffer, 0, n)
-                        if (terminal) mutable.update { it.copy(terminal = bytes.toString("UTF-8").substringBefore(completion).takeLast(100_000)) }
+                        if (terminal) mutable.update { it.copy(terminal = (terminalPrefix + bytes.toString("UTF-8").substringBefore(directoryMarker).substringBefore(completion)).takeLast(100_000)) }
                     }
                 }
                 if (timeout.isDone) error("命令超过 30 秒，已停止")
                 val result = bytes.toString("UTF-8")
                 val index = result.lastIndexOf(completion)
                 check(index >= 0 && result.substring(index + completion.length).trim().toIntOrNull() != null) { "命令已停止或连接中断，输出可能不完整" }
-                return result.substring(0, index).trimEnd('\r', '\n')
+                var output = result.substring(0, index)
+                if (terminal) {
+                    val directoryIndex = output.lastIndexOf(directoryMarker)
+                    check(directoryIndex >= 0) { "未收到当前目录，输出可能不完整" }
+                    val encodedPath = output.substring(directoryIndex + directoryMarker.length).trim()
+                    val path = String(android.util.Base64.decode(encodedPath, android.util.Base64.DEFAULT), Charsets.UTF_8).removeSuffix("\n")
+                    check(path.startsWith('/') && '\u0000' !in path) { "设备返回的目录不合法" }
+                    mutable.update { it.copy(terminalPath = path) }
+                    output = output.substring(0, directoryIndex)
+                }
+                return output.trimEnd('\r', '\n')
             } finally { timeout.cancel(false); if (terminal) terminalStream = null }
         }
     }
@@ -151,13 +173,26 @@ class AssistantModel(application: Application) : AndroidViewModel(application) {
     /** 执行终端命令并保存最近二十条命令。 */
     fun command(command: String) = runAction {
         require(command.isNotBlank()) { "请输入 shell 命令" }
-        mutable.update { it.copy(history = (listOf(command) + it.history).distinct().take(20), terminal = "$ $command\n") }
-        val output = shell(command, terminal = true)
-        mutable.update { it.copy(terminal = "$ $command\n$output\n执行完成") }
+        check(manager.isConnected) { "请先连接设备 B" }
+        terminalStopRequested = false
+        val previous = mutable.value.terminal.trimEnd()
+        val prefix = (if (previous.isEmpty()) "" else "$previous\n\n") + "${mutable.value.terminalPath} $ $command\n"
+        mutable.update { it.copy(history = (listOf(command) + it.history).distinct().take(20), terminal = prefix.takeLast(100_000), terminalRunning = true) }
+        try {
+            val output = shell(command, terminal = true, terminalPrefix = prefix)
+            mutable.update { it.copy(terminal = (prefix + output + "\n").takeLast(100_000)) }
+        } catch (e: Exception) {
+            val reason = if (terminalStopRequested) "命令已停止" else e.message ?: "命令执行失败"
+            val connected = manager.isConnected
+            mutable.update { it.copy(terminal = (it.terminal.trimEnd() + "\n[$reason]\n").takeLast(100_000), connected = connected, terminalPath = if (connected) it.terminalPath else "/") }
+        } finally { mutable.update { it.copy(terminalRunning = false) } }
     }
 
     /** 停止当前终端流，释放长期运行的命令。 */
-    fun stopCommand() { terminalStream?.let { runCatching { it.close() } } }
+    fun stopCommand() {
+        terminalStopRequested = true
+        terminalStream?.let { runCatching { it.close() } }
+    }
 
     /** 清空终端显示。 */
     fun clearTerminal() { mutable.update { it.copy(terminal = "") } }

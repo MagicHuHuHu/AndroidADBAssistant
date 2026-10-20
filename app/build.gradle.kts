@@ -4,6 +4,14 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 android {
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("F:\\AndroidKey\\Magic2.jks")
+            storePassword = "123qweASD"
+            keyAlias = "Magic"
+            keyPassword = "123qweASD"
+        }
+    }
     namespace = "com.adbside.assistant"
     compileSdk = 36
     defaultConfig {
@@ -21,6 +29,11 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     packaging { resources.excludes += setOf("META-INF/versions/9/OSGI-INF/MANIFEST.MF", "META-INF/*.md") }
+    buildTypes {
+        getByName("release") {
+            signingConfig = signingConfigs.getByName("debug")
+        }
+    }
 }
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2025.01.00"))

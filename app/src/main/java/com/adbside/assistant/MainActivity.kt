@@ -14,10 +14,25 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.automirrored.outlined.Send
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.unit.sp
 import androidx.compose.material.icons.outlined.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -69,7 +84,7 @@ fun AssistantApp(model: AssistantModel = viewModel()) {
             }
         }
     }) { padding ->
-        Column(Modifier.fillMaxSize().padding(padding).imePadding()) {
+        Column(Modifier.fillMaxSize().padding(padding).consumeWindowInsets(padding).imePadding()) {
             if (state.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
             when (tab) {
                 0 -> DevicePage(model, state)
@@ -357,27 +372,61 @@ private fun TransfersPage(model: AssistantModel, state: AssistantState, back: ()
 private fun TerminalPage(model: AssistantModel, state: AssistantState) {
     var input by rememberSaveable { mutableStateOf("") }
     var history by remember { mutableStateOf(false) }
+    val focusRequester = remember { FocusRequester() }
+    val keyboard = LocalSoftwareKeyboardController.current
+    val scroll = rememberScrollState()
+    val keyboardVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
+    val terminalStyle = TextStyle(color = Color(0xFFE7EDF4), fontFamily = FontFamily.Monospace, fontSize = 14.sp, lineHeight = 21.sp)
+
+    /** 在提示符处提交命令，执行期间阻止重复提交。 */
+    fun submitCommand() {
+        if (state.connected && !state.busy && input.isNotBlank()) {
+            model.command(input)
+            input = ""
+        }
+    }
+
+    LaunchedEffect(state.terminal, state.terminalRunning, scroll.viewportSize, scroll.maxValue) { scroll.scrollTo(scroll.maxValue) }
     Column(Modifier.fillMaxSize().padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         PageHeader("命令终端", state)
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            listOf("设备型号" to "getprop ro.product.model", "查看进程" to "ps -A", "存储空间" to "df -h /sdcard").forEach { (name, command) ->
-                SuggestionChip({ input = command }, { Text(name) })
+        if (!keyboardVisible) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                listOf("设备型号" to "getprop ro.product.model", "查看进程" to "ps -A", "存储空间" to "df -h /sdcard").forEach { (name, command) ->
+                    SuggestionChip({ input = command }, { Text(name) })
+                }
             }
+            Text("点击终端输入，按 Enter 执行 · 单次执行上限 30 秒", style = MaterialTheme.typography.bodySmall)
         }
-        Text("直接输入 shell 命令，无需 adb shell 前缀；单次执行上限 30 秒。", style = MaterialTheme.typography.bodySmall)
-        Surface(Modifier.fillMaxWidth().weight(1f), shape = MaterialTheme.shapes.medium, color = Color(0xFF1D2229)) {
-            val scroll = rememberScrollState()
-            LaunchedEffect(state.terminal) { scroll.scrollTo(scroll.maxValue) }
-            Text(state.terminal, Modifier.padding(14.dp).verticalScroll(scroll), color = Color(0xFFE7EDF4), fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+        Surface(Modifier.fillMaxWidth().weight(1f).clickable {
+            if (state.connected && !state.busy) { focusRequester.requestFocus(); keyboard?.show() }
+        }, shape = MaterialTheme.shapes.medium, color = Color(0xFF1D2229)) {
+            Column(Modifier.fillMaxSize().verticalScroll(scroll).padding(14.dp)) {
+                SelectionContainer {
+                    Text(state.terminal.trimEnd('\r', '\n'), style = terminalStyle)
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+                    Text(if (state.terminalRunning) "… " else "${state.terminalPath} $ ",
+                        modifier = Modifier.widthIn(max = 180.dp), style = terminalStyle.copy(color = Color(0xFF59D8C3)))
+                    // 输入与输出共用终端背景，不显示独立边框和发送按钮。
+                    BasicTextField(value = input, onValueChange = { input = it.replace('\n', ' ').replace('\r', ' ') },
+                        modifier = Modifier.weight(1f).heightIn(min = 28.dp).focusRequester(focusRequester).onPreviewKeyEvent {
+                            if (it.key == Key.Enter || it.key == Key.NumPadEnter) {
+                                if (it.type == KeyEventType.KeyDown) submitCommand()
+                                true
+                            } else false
+                        },
+                        textStyle = terminalStyle, cursorBrush = SolidColor(Color(0xFF59D8C3)),
+                        readOnly = !state.connected || state.busy, singleLine = true,
+                        keyboardOptions = KeyboardOptions(autoCorrectEnabled = false, keyboardType = KeyboardType.Text, imeAction = ImeAction.Go),
+                        keyboardActions = KeyboardActions(onGo = { submitCommand() }))
+                }
+            }
         }
         Row {
             TextButton({ history = true }) { Text("历史记录") }
-            TextButton(model::clearTerminal) { Text("清空输出") }
-            if (state.busy) TextButton(model::stopCommand) { Text("停止命令") }
-        }
-        Row(Modifier.padding(bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(input, { input = it }, Modifier.weight(1f), placeholder = { Text("输入 shell 命令") }, maxLines = 3)
-            IconButton({ model.command(input) }, enabled = state.connected && !state.busy && input.isNotBlank()) { Icon(Icons.AutoMirrored.Outlined.Send, "执行", tint = MaterialTheme.colorScheme.primary) }
+            TextButton(model::clearTerminal, enabled = !state.terminalRunning) { Text("清空输出") }
+            if (state.terminalRunning) TextButton(model::stopCommand) { Text("停止命令") }
         }
     }
     if (history) AlertDialog(onDismissRequest = { history = false }, title = { Text("历史记录") },
